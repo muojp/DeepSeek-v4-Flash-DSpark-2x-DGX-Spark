@@ -95,6 +95,18 @@ py_files+=(
   tests/test_dspark_stacked_mapping.py
   tests/test_issue133_triton_specialization.py
   lmcache/patch-compose-lmcache.py
+  tests/test_tokentrace_sources.py
+  tests/test_tokentrace_runtime.py
+  tokentrace/__init__.py
+  tokentrace/__main__.py
+  tokentrace/sources.py
+  tokentrace/nvml.py
+  tokentrace/writer.py
+  tokentrace/control.py
+  tokentrace/sampler.py
+  tokentrace/probe.py
+  tokentrace/analyze.py
+  scripts/test-tokentrace-experts-gpu.py
 )
 python3 -m py_compile "${py_files[@]}"
 ok "py_compile ${#py_files[@]} files"
@@ -179,6 +191,9 @@ ok "test_sp_indexer_prefill"
 python3 tests/test_dspark_stacked_mapping.py -q
 ok "test_dspark_stacked_mapping"
 python3 tests/test_issue133_triton_specialization.py -q
+if ! python3 -c 'import pytest' 2>/dev/null; then python3 -m pip install -q --user pytest || bad "pytest install"; fi
+python3 -m pytest -q tests/test_tokentrace_*.py || bad "tokentrace pytest"
+ok "tokentrace pytest"
 ok "test_issue133_triton_specialization"
 python3 scripts/verify-dsv4-027-equality-gate.py
 ok "verify-dsv4-027-equality-gate"

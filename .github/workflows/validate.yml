@@ -21,5 +21,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - name: Install test deps (tokentrace pytest)
+        run: python3 -m pip install -q pytest pillow numpy
       - name: Run CPU recipe gates
         run: bash scripts/ci-validate.sh
