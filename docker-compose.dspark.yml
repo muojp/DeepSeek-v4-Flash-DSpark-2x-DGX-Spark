@@ -312,6 +312,11 @@ services:
       DRAFT_SAMPLE_METHOD: "${DRAFT_SAMPLE_METHOD:-probabilistic}"
       DEFAULT_THINKING: "${DEFAULT_THINKING:-low}"
       DSPARK_SKIP_HOTFIX: "${DSPARK_SKIP_HOTFIX:-0}"
+      # tokentrace (docs/TOKENTRACE.md): 1 = apply the V2-runner expert-routing
+      # recorder hotfix at boot and log per-step routing under DSPARK_TOKENTRACE_DIR
+      # (HF volume → host ~/.cache/huggingface/tokentrace). 0 (default) = off.
+      DSPARK_TOKENTRACE_EXPERTS: "${DSPARK_TOKENTRACE_EXPERTS:-0}"
+      DSPARK_TOKENTRACE_DIR: "${DSPARK_TOKENTRACE_DIR:-/cache/huggingface/tokentrace}"
       DSPARK_SKIP_ISSUE22_HOTFIX: "${DSPARK_SKIP_ISSUE22_HOTFIX:-0}"
       DSPARK_SKIP_SUPPRESS_STOPS_HOTFIX: "${DSPARK_SKIP_SUPPRESS_STOPS_HOTFIX:-0}"
       # Issue #52 / PR #53: render a generation header when a request's
@@ -484,6 +489,7 @@ services:
           max) DEFAULT_CHAT_TEMPLATE_KWARGS='{"thinking":true,"reasoning_effort":"max"}' ;;
           *) echo "DEFAULT_THINKING must be one of: off, low, high, max (got: $${DEFAULT_THINKING})" >&2; exit 2 ;;
         esac;
+        case "$${DSPARK_TOKENTRACE_EXPERTS:-0}" in 1) python3 /opt/dspark-patches/hotfix-dsv4-tokentrace-experts.py || exit 1; python3 /opt/dspark-patches/hotfix-dsv4-tokentrace-experts.py --status || exit 1 ;; 0|"") ;; *) echo "DSPARK_TOKENTRACE_EXPERTS must be 0 or 1 (got: $${DSPARK_TOKENTRACE_EXPERTS})" >&2; exit 2 ;; esac;
         REVISION_ARGS="";
         if [ -n "$${DSPARK_REVISION:-}" ]; then REVISION_ARGS="--revision $${DSPARK_REVISION}"; fi;
         LIMIT_MM_RAW='${LIMIT_MM_PER_PROMPT:-image=8}'; case "$${LIMIT_MM_RAW}" in image=*) _lim_n="$${LIMIT_MM_RAW#image=}"; case "$${_lim_n}" in ''|*[!0-9]*) echo "error: LIMIT_MM_PER_PROMPT image=N needs an integer (Anemll --limit-mm-per-prompt requires JSON)" >&2; exit 2 ;; esac; LIMIT_MM_JSON="{\"image\":$${_lim_n}}" ;; *) LIMIT_MM_JSON="$${LIMIT_MM_RAW}" ;; esac; LIMIT_MM_ARGS=(--limit-mm-per-prompt "$${LIMIT_MM_JSON}");
