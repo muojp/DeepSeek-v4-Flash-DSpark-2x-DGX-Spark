@@ -47,7 +47,7 @@ engine step is waiting on — and to test the working hypothesis:
 | Does the SSD move at all during decode? (expert paging, swap) | `/proc/diskstats nvme0n1` sectors read/written, io ticks; `/proc/vmstat` `pswpin`, `pswpout`, `pgmajfault` | same | — |
 | Unified memory pressure | `/proc/meminfo` MemFree/MemAvailable/Cached/AnonPages/Shmem/SwapFree; NVML compute-process memory (GPU-held part of the pool) | 1 Hz | — |
 | CPU-side stalls (scheduler, tokenizer, Python) | `/proc/stat` cpu totals; `/proc/<pid>/stat` utime/stime/`voluntary_ctxt_switches` for `VLLM::EngineCore` and `VLLM::Worker_TP*` | 10 Hz | — |
-| Which experts fired for which token? | **runner-side log** (`patches/hotfix-dsv4-tokentrace-experts.py`, gate `DSPARK_TOKENTRACE_EXPERTS=1`): the V2 GPU model runner copies every MoE router's `topk_ids` into a fixed device buffer inside the CUDA graph and appends `[n, 43, 6]` uint8 per engine step + an index line (`req`, `sched`, `pos`, `draft`, `sampled`, `rejected`) to `~/.cache/huggingface/tokentrace/experts-*.{idx.jsonl,u8}` on each node. `--enable-return-routed-experts` is unusable: DSpark exists only in the V2 runner, which rejects it. | per step | 39 µs/step, 258 B/token; needs a restart to enable |
+| Which experts fired for which token? | **runner-side log** (`patches/hotfix-dsv4-tokentrace-experts.py`, gate `DSPARK_TOKENTRACE_EXPERTS=1`): the V2 GPU model runner copies every MoE router's `topk_ids` into a fixed device buffer inside the CUDA graph and appends `[n, 43, 6]` uint8 per engine step + an index line (`req`, `sched`, `pos`, `draft`, `sampled`, `rejected`, accepted `tokens`) to `~/.cache/huggingface/tokentrace/experts-*.{idx.jsonl,u8}` on each node. Output is stored as token IDs, not plaintext; a same-host UI can explicitly detokenize it. `--enable-return-routed-experts` is unusable: DSpark exists only in the V2 runner, which rejects it. | per step | one extra small token-ID D2H alongside the 258 B/token routing copy; needs a restart to enable |
 | Cross-node clock offset | UDP 4-timestamp exchange between the two samplers over the fabric | 1 Hz | — |
 
 Not available without a restart, and out of scope for now: in-step kernel
@@ -73,7 +73,7 @@ corrupts the series.
 ```json
 {"type":"meta","t":…,"m":…,"host":"dgx01","boot_id":"a72d…","kernel":"6.17.0-1029-nvidia",
  "role":"head","pid":1234,"version":1,
- "config":{"fast_hz":50,"slow_hz":1,"vllm_hz":10,"vllm_url":"http://127.0.0.1:8888","peer":"192.168.100.40"},
+ "config":{"fast_hz":50,"slow_hz":1,"vllm_hz":10,"vllm_url":"http://127.0.0.1:8888","peer":"192.0.2.40"},
  "hca":[{"name":"rocep1s0f0","port":1,"rate":"200 Gb/sec (2X NDR)","state":"ACTIVE"}],
  "net":["enp1s0f0np0"],"disks":["nvme0n1"],
  "gpu":{"name":"NVIDIA GB10","nvml":"580.173","supports":{"util":true,"memory_info":false,"pcie":false,"samples":["gpu_util","mem_util"]}},
@@ -132,7 +132,7 @@ is streaming (one chunk per step in practice — see §4).
 ### 2.5 `clock` — 1 Hz, head node (offset of the peer's clock)
 
 ```json
-{"type":"clock","t":…,"m":…,"peer":"192.168.100.40","rtt_us":83,"offset_us":-412,"n":8}
+{"type":"clock","t":…,"m":…,"peer":"192.0.2.40","rtt_us":83,"offset_us":-412,"n":8}
 ```
 
 NTP-style: `offset = ((t1 - t0) + (t2 - t3)) / 2` over the fabric (RTT
@@ -186,13 +186,32 @@ delta between the bracketing samples give tokens-per-step.
 
 Index: first line `{"type":"meta","layers":43,"topk":6,"max_tokens":8192,…}`,
 then one line per engine step:
-`{"step":300,"t":…,"n":6,"off":504132,"len":1548,"req":["chatcmpl-…"],"sched":[6],"pos":[983],"draft":[5],"sampled":[2],"rejected":[4]}`.
+`{"step":300,"t":…,"n":6,"off":504132,"len":1548,"req":["chatcmpl-…"],"sched":[6],"pos":[983],"draft":[5],"sampled":[2],"rejected":[4],"tokens":[[123,456]]}`.
 `.u8` holds `n × 43 × 6` expert ids per step at byte `off`. Rows are in
 request order; for request *i* the first `sampled[i]` of its `sched[i]`
 rows are real tokens at positions `pos[i]…`, the rest rejected drafts.
+`tokens[i]` contains those accepted output token IDs in generation order;
+plaintext is not written unless a separate subscriber explicitly decodes it.
 `analyze` maps steps to a probe request by time window and reports
 distinct experts per step / per request and the token-to-token switch
 fraction (§3).
+
+Same-host sparkDash follows the newest file pair read-only. It starts at the
+latest complete index record, then consumes each newly flushed record and
+reads only the bounded routing rows needed by the live view. While subscribed,
+sparkDash holds a shared advisory lock on the active index. The recorder tests
+that lock without changing file data and shortens
+`DSPARK_TOKENTRACE_FLUSH_S` (default 2 s) to
+`DSPARK_TOKENTRACE_SUBSCRIBER_FLUSH_S` (default 50 ms). Binary data is flushed
+before its index record. Closing the final browser releases the lock and
+restores the normal interval; the complete `.idx.jsonl`/`.u8` log remains
+authoritative.
+
+`tokentrace/deploy.sh` resolves the head, linked worker, SSH destinations and
+worker CX-7 peer address from sparkDash `GET /api/sparks`. Set the
+deployment-specific URL explicitly, for example
+`TT_SPARKDASH_URL=http://sparkdash.example.lan:5555`. `TT_HEAD`, `TT_WORKER` and
+`TT_WORKER_PEER` together remain a recovery override.
 
 ## 3. Derived per-step record (analysis output, not stored by the sampler)
 
@@ -268,6 +287,12 @@ One frame per 1/30 s of slowed-down generation (default ×0.25), rendered
 with Pillow and encoded by ffmpeg. Inputs: the `analyze --out` JSON, the
 per-chunk text/token file (`<req>-chunks.json`, from vLLM `/tokenize`) and
 the runner expert log. What it shows and why:
+
+The primary render path uses only tokentrace files. Grafana/Prometheus input
+is optional (`--grafana`) and only augments the machine row when a separate
+time-series stack happens to be installed. DGX Spark does not include that
+stack by default. The header timecode is each token/step's local wall-clock
+time (`HH:MM:SS.ss`), not elapsed video time.
 
 | Element | Encoding | Reason |
 |---|---|---|

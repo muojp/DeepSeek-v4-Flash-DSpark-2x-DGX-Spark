@@ -13,8 +13,8 @@ What it does
      MoE router (``BaseRouter.set_capture_fn``) so the graph capture that
      follows includes the copy of ``topk_ids`` into a fixed device buffer.
    - ``sample_tokens``: right after ``self.sample(...)`` → one non-blocking
-     D2H of the routing buffer + sampler counts, drained to disk when the
-     CUDA event says it landed.
+     D2H of the routing buffer + accepted token ids + sampler counts, drained
+     to disk when the CUDA event says it landed.
    - ``shutdown``: flush + close.
 
 Runtime gate: the code path is a no-op unless the container env has
@@ -67,7 +67,7 @@ A_SAMPLE = ("        sampler_output, num_sampled, num_rejected = self.sample(\n"
 assert src.count(A_SAMPLE) == 1, "tokentrace: sample_tokens anchor not found"
 src = src.replace(A_SAMPLE, A_SAMPLE +
                   f"        if getattr(self, \"tokentrace\", None) is not None:  {MARK}\n"
-                  f"            self.tokentrace.record(input_batch, num_sampled, num_rejected)  {MARK}\n", 1)
+                  f"            self.tokentrace.record(input_batch, sampler_output.sampled_token_ids, num_sampled, num_rejected)  {MARK}\n", 1)
 
 # 4. shutdown flush
 A_SHUT = ("    def shutdown(self) -> None:\n"

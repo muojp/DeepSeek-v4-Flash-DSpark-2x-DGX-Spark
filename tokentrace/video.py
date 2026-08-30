@@ -44,6 +44,7 @@ import math
 import os
 import subprocess
 import sys
+from datetime import datetime
 from pathlib import Path
 
 import numpy as np
@@ -66,6 +67,12 @@ LO = np.array([8, 36, 50], dtype=np.float32)
 HI = np.array([90, 230, 255], dtype=np.float32)
 
 L_LAYERS, N_EXPERTS, TOPK = 43, 256, 6
+
+
+def format_timecode(epoch_s: float, tz=None) -> str:
+    """Wall-clock token time at centisecond precision."""
+    dt = datetime.fromtimestamp(epoch_s, tz=tz)
+    return dt.strftime("%H:%M:%S.") + f"{dt.microsecond // 10_000:02d}"
 
 
 def font(size: int, mono: bool = True):
@@ -323,8 +330,8 @@ class Renderer:
         d = ImageDraw.Draw(img)
         # header
         d.text((96, 22), "DeepSeek-V4-Flash · 2× DGX Spark (TP=2 over RoCE, MTP-5) — what happens behind each token", font=self.f_title, fill=FG)
-        elapsed = t_real - self.t0
-        d.text((96, 58), f"t = {elapsed:6.2f} s    engine step {self.applied:3d}/{len(self.steps)}    playback ×{1 / self.slowmo:.2g}", font=self.f, fill=DIM)
+        token_t = cur.t if cur else t_real
+        d.text((96, 58), f"token {format_timecode(token_t)}    engine step {self.applied:3d}/{len(self.steps)}    playback ×{1 / self.slowmo:.2g}", font=self.f, fill=DIM)
         # map
         img.paste(self._heat_image(cur, t_real), (self.map_x, self.map_y))
         # node status strips: left edge = dgx01, right edge = dgx02 (red while paging in this step)
@@ -540,7 +547,7 @@ def build_parser(p=None):
     p.add_argument("--tau", type=float, default=4.0, help="heat decay time constant (s of generation time)")
     p.add_argument("--limit", type=float, default=None, help="only the first N real seconds")
     p.add_argument("--flash-frames", type=float, default=4.0, help="frames a step flash stays visible (decaying)")
-    p.add_argument("--grafana", default=None, help="Prometheus query_range dump (gpu_temp_c / gpu_power_w / rdma_rx_gbps per host)")
+    p.add_argument("--grafana", default=None, help="optional Prometheus query_range dump; rendering never requires Grafana/Prometheus")
     p.add_argument("--still", type=float, default=None, help="also write one PNG at this real second")
     return p
 

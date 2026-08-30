@@ -317,6 +317,11 @@ services:
       # (HF volume → host ~/.cache/huggingface/tokentrace). 0 (default) = off.
       DSPARK_TOKENTRACE_EXPERTS: "${DSPARK_TOKENTRACE_EXPERTS:-0}"
       DSPARK_TOKENTRACE_DIR: "${DSPARK_TOKENTRACE_DIR:-/cache/huggingface/tokentrace}"
+      # Buffered SSD writes normally flush every two seconds. A same-host
+      # read-only sparkDash subscriber holds a shared lock on the active index;
+      # while that lock exists the recorder publishes data+index every 50 ms.
+      DSPARK_TOKENTRACE_FLUSH_S: "${DSPARK_TOKENTRACE_FLUSH_S:-2.0}"
+      DSPARK_TOKENTRACE_SUBSCRIBER_FLUSH_S: "${DSPARK_TOKENTRACE_SUBSCRIBER_FLUSH_S:-0.05}"
       DSPARK_SKIP_ISSUE22_HOTFIX: "${DSPARK_SKIP_ISSUE22_HOTFIX:-0}"
       DSPARK_SKIP_SUPPRESS_STOPS_HOTFIX: "${DSPARK_SKIP_SUPPRESS_STOPS_HOTFIX:-0}"
       # Issue #52 / PR #53: render a generation header when a request's

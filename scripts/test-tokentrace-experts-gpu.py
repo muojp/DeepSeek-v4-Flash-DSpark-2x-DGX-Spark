@@ -102,23 +102,24 @@ def main():
     g.replay()
     ns = torch.tensor([1, 3], dtype=torch.int32, device=dev)
     nr = torch.tensor([0, 2], dtype=torch.int32, device=dev)
-    rec.record(fake_batch(["a", "b"], [3, 4], [100, 7], draft=[0, 5]), ns, nr)
+    toks = torch.tensor([[101, -1, -1], [201, 202, 203]], dtype=torch.int32, device=dev)
+    rec.record(fake_batch(["a", "b"], [3, 4], [100, 7], draft=[0, 5]), toks, ns, nr)
 
     # --- replay 2: overwrite, fewer tokens scheduled (n=4)
     for i in range(L + 1):
         static[i].fill_(200 + i)
     g.replay()
-    rec.record(fake_batch(["c"], [4], [0]), torch.tensor([4], device=dev), torch.tensor([0], device=dev))
+    rec.record(fake_batch(["c"], [4], [0]), torch.tensor([[301, 302, 303, 304]], device=dev), torch.tensor([4], device=dev), torch.tensor([0], device=dev))
 
     # --- replays 3..8: ring-slot reuse
     for k in range(6):
         for i in range(L + 1):
             static[i].fill_(k)
         g.replay()
-        rec.record(fake_batch(["d"], [2], [k]), torch.tensor([1], device=dev), torch.tensor([0], device=dev))
+        rec.record(fake_batch(["d"], [2], [k]), torch.tensor([[400 + k]], device=dev), torch.tensor([1], device=dev), torch.tensor([0], device=dev))
 
     # --- n beyond max_tokens is clamped, not an error
-    rec.record(fake_batch(["e"], [MAXT + 100], [0]), torch.tensor([1], device=dev), torch.tensor([0], device=dev))
+    rec.record(fake_batch(["e"], [MAXT + 100], [0]), torch.tensor([[500]], device=dev), torch.tensor([1], device=dev), torch.tensor([0], device=dev))
 
     rec.close()
 
@@ -131,6 +132,7 @@ def main():
     st = steps[0]
     assert st["req"] == ["a", "b"] and st["sched"] == [3, 4] and st["pos"] == [100, 7] and st["draft"] == [0, 5]
     assert st["sampled"] == [1, 3] and st["rejected"] == [0, 2]
+    assert st["tokens"] == [[101], [201, 202, 203]]
     arr = np.frombuffer(data[st["off"]: st["off"] + st["len"]], dtype=np.uint8).reshape(st["n"], L, K)
     assert np.array_equal(arr, expect1), (arr[:2], expect1[:2])
     st2 = steps[1]
@@ -146,9 +148,9 @@ def main():
 
     # ---- exception inside record disables, never raises
     rec2 = mod.ExpertTraceRecorder(num_layers=L, topk=K, max_tokens=MAXT, device=dev, out_dir=out, rank=1, host="testhost")
-    rec2.record(types.SimpleNamespace(num_tokens=3), None, None)  # missing attrs → exception path
+    rec2.record(types.SimpleNamespace(num_tokens=3), None, None, None)  # missing attrs → exception path
     assert rec2.disabled
-    rec2.record(fake_batch(["x"], [1], [0]), ns, nr)  # no-op now
+    rec2.record(fake_batch(["x"], [1], [0]), toks, ns, nr)  # no-op now
     rec2.close()
 
     # ---- overhead estimate: 1000 record() calls with n=12 (decode-like), graph replay each
@@ -160,7 +162,7 @@ def main():
     import time
     t0 = time.perf_counter()
     for _ in range(1000):
-        rec3.record(b, ns, nr)
+        rec3.record(b, toks, ns, nr)
     torch.cuda.synchronize()
     dt = (time.perf_counter() - t0) / 1000
     rec3.close()

@@ -20,6 +20,9 @@ Files (in ``DSPARK_TOKENTRACE_DIR``, default ``/cache/huggingface/tokentrace``
 Index line: ``{"step":n,"t":wall,"n":num_tokens,"off":byte_offset,"len":bytes,
 "req":[ids],"sched":[tokens per req],"pos":[first position per req],
 "draft":[draft tokens per req]|null,"sampled":[per req],"rejected":[per req]}``.
+``tokens`` contains the accepted output token ids per request for that step;
+the recorder deliberately stores ids rather than decoded text so plaintext
+output is only exposed when a same-host subscriber explicitly enables it.
 Token rows are in the same order as the model saw them (request order of
 ``InputBatch.req_ids`` with ``sched`` tokens each), so row ``pos[i]+j`` of
 request ``i`` is the token at sequence position ``pos[i]+j``.
@@ -33,6 +36,7 @@ logs once — it can never take the engine down.
 """
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import platform
@@ -50,6 +54,14 @@ ENV_ENABLE = "DSPARK_TOKENTRACE_EXPERTS"
 ENV_DIR = "DSPARK_TOKENTRACE_DIR"
 DEFAULT_DIR = "/cache/huggingface/tokentrace"
 RING = 4
+
+
+def _positive_float_env(name: str, default: float) -> float:
+    try:
+        value = float(os.environ.get(name, str(default)))
+    except ValueError:
+        return default
+    return value if value > 0 else default
 
 
 def _num_layers(hf_config) -> int:
@@ -74,6 +86,7 @@ class ExpertTraceRecorder:
         self.ring = [torch.empty((max_tokens, num_layers, topk), dtype=torch.uint8, pin_memory=True) for _ in range(RING)]
         self.ring_ns = [torch.empty((max_tokens,), dtype=torch.int32, pin_memory=True) for _ in range(RING)]
         self.ring_nr = [torch.empty((max_tokens,), dtype=torch.int32, pin_memory=True) for _ in range(RING)]
+        self.ring_tokens = [torch.empty((max_tokens,), dtype=torch.int32, pin_memory=True) for _ in range(RING)]
         self.events = [torch.cuda.Event() for _ in range(RING)]
         self.pending: list[dict] = []  # metas whose ring slot is still in flight
         self.slot = 0
@@ -81,7 +94,10 @@ class ExpertTraceRecorder:
         self.disabled = False
         self.bytes_written = 0
         self._last_flush = time.monotonic()
+        self.flush_s = _positive_float_env("DSPARK_TOKENTRACE_FLUSH_S", 2.0)
+        self.subscriber_flush_s = _positive_float_env("DSPARK_TOKENTRACE_SUBSCRIBER_FLUSH_S", 0.05)
         host = host or platform.node().split(".")[0] or socket.gethostname()
+        self.host, self.rank = host, rank
         os.makedirs(out_dir, exist_ok=True)
         stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
         base = os.path.join(out_dir, f"experts-{host}-r{rank}-{os.getpid()}-{stamp}")
@@ -92,6 +108,24 @@ class ExpertTraceRecorder:
                                    "layers": num_layers, "topk": topk, "max_tokens": max_tokens, "dtype": "u8",
                                    "layout": "[n, layers, topk] C-order", **(meta or {})}) + "\n")
         self.idx.flush()
+
+    def _subscriber_active(self) -> bool:
+        """A read-only sparkDash tailer holds a shared lock on the index.
+
+        Testing an exclusive lock changes no file data and works across bind
+        mounts/containers because both paths reference the same local inode.
+        """
+        try:
+            fcntl.flock(self.idx.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return True
+        except OSError:
+            return False
+        try:
+            fcntl.flock(self.idx.fileno(), fcntl.LOCK_UN)
+        except OSError:
+            pass
+        return False
 
     # ── model side (inside the CUDA graph) ───────────────────────────
     def capture(self, layer_id: int, topk_ids: torch.Tensor) -> None:
@@ -115,7 +149,8 @@ class ExpertTraceRecorder:
         return bound
 
     # ── runner side (after sampling, once per step) ──────────────────
-    def record(self, input_batch, num_sampled: torch.Tensor, num_rejected: torch.Tensor) -> None:
+    def record(self, input_batch, sampled_token_ids: torch.Tensor,
+               num_sampled: torch.Tensor, num_rejected: torch.Tensor) -> None:
         if self.disabled:
             return
         try:
@@ -134,6 +169,15 @@ class ExpertTraceRecorder:
                 nreq = int(input_batch.num_reqs)
                 self.ring_ns[s][:nreq].copy_(num_sampled[:nreq].to(torch.int32), non_blocking=True)
                 self.ring_nr[s][:nreq].copy_(num_rejected[:nreq].to(torch.int32), non_blocking=True)
+                token_rows = sampled_token_ids[:nreq]
+                if token_rows.ndim == 1:
+                    token_rows = token_rows.unsqueeze(1)
+                token_width = int(token_rows.shape[1])
+                token_count = nreq * token_width
+                if token_count > self.max_tokens:
+                    raise ValueError(f"sampled token buffer too small: {token_count}>{self.max_tokens}")
+                self.ring_tokens[s][:token_count].copy_(
+                    token_rows.reshape(-1).to(torch.int32), non_blocking=True)
                 self.events[s].record(stream)
             draft = getattr(input_batch, "num_draft_tokens_per_req", None)
             self.pending.append({
@@ -142,6 +186,7 @@ class ExpertTraceRecorder:
                 "sched": [int(x) for x in input_batch.num_scheduled_tokens[:nreq]],
                 "pos": [int(x) for x in input_batch.num_computed_tokens_np[:nreq]],
                 "draft": None if draft is None else [int(x) for x in draft[:nreq]],
+                "token_width": token_width,
             })
             self.step += 1
             self.slot = (s + 1) % RING
@@ -167,23 +212,34 @@ class ExpertTraceRecorder:
         off = self.data.tell()
         self.data.write(blob)
         self.bytes_written += len(blob)
+        sampled = self.ring_ns[s][:nreq].tolist()
+        token_width = m["token_width"]
+        flat_tokens = self.ring_tokens[s][:nreq * token_width].tolist()
+        tokens = []
+        for i, count in enumerate(sampled):
+            accepted = max(0, min(int(count), token_width))
+            row = flat_tokens[i * token_width:(i + 1) * token_width]
+            tokens.append([int(token) for token in row[:accepted] if int(token) >= 0])
         rec = {"step": m["step"], "t": m["t"], "n": n, "off": off, "len": len(blob), "req": m["req"],
                "sched": m["sched"], "pos": m["pos"], "draft": m["draft"],
-               "sampled": self.ring_ns[s][:nreq].tolist(), "rejected": self.ring_nr[s][:nreq].tolist()}
+               "sampled": sampled, "rejected": self.ring_nr[s][:nreq].tolist(), "tokens": tokens}
         self.idx.write(json.dumps(rec, separators=(",", ":")) + "\n")
         now = time.monotonic()
-        if m["step"] % 50 == 0 or now - self._last_flush >= 2.0:
-            self.idx.flush()
+        flush_s = self.subscriber_flush_s if self._subscriber_active() else self.flush_s
+        if m["step"] % 50 == 0 or now - self._last_flush >= flush_s:
+            # Publish binary data before its index record so a read-only tailer
+            # never observes a flushed offset whose bytes are still buffered.
             self.data.flush()
+            self.idx.flush()
             self._last_flush = now
 
     def flush(self) -> None:
         try:
             self._drain(force=True)
-            self.idx.flush()
             self.data.flush()
-            os.fsync(self.idx.fileno())
+            self.idx.flush()
             os.fsync(self.data.fileno())
+            os.fsync(self.idx.fileno())
         except Exception as e:  # noqa: BLE001
             logger.warning("[tokentrace] flush failed: %r", e)
 
