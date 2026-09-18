@@ -123,6 +123,17 @@ services:
       HF_HUB_OFFLINE: "${HF_HUB_OFFLINE:-0}"
       TRANSFORMERS_OFFLINE: "${TRANSFORMERS_OFFLINE:-0}"
       HF_HUB_DISABLE_XET: "${HF_HUB_DISABLE_XET:-1}"
+      # vLLM reports a hardware and model fingerprint to https://stats.vllm.ai on engine start
+      # unless told not to: a UUID, CPU/memory sizes, GPU type, kernel string, the model
+      # architecture and the vLLM version (no prompts). The image sets
+      # VLLM_USAGE_SOURCE=production-docker-image, so the report is on by default here; this box
+      # is not ours to advertise, so both ranks opt out. DO_NOT_TRACK is the generic form the
+      # same code path honours. Set either to 0 to restore the default.
+      VLLM_NO_USAGE_STATS: "${VLLM_NO_USAGE_STATS:-1}"
+      DO_NOT_TRACK: "${DO_NOT_TRACK:-1}"
+      # huggingface_hub adds a telemetry header on every download; serving runs offline anyway,
+      # but the first fetch does not.
+      HF_HUB_DISABLE_TELEMETRY: "${HF_HUB_DISABLE_TELEMETRY:-1}"
       DSPARK_MODEL: "${DSPARK_MODEL:-deepseek-ai/DeepSeek-V4-Flash-Vision-Exp}"
       # Optional in-memory refusal-direction projection. The launcher stages
       # the tiny direction file into the existing HF cache on both nodes.
